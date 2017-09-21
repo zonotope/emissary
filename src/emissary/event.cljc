@@ -4,7 +4,7 @@
   (get-id [event]))
 
 (extend-protocol Event
-  clojure.lang.keyword
+  clojure.lang.Keyword
   (get-id [event]
     event)
 
