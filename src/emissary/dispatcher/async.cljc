@@ -2,63 +2,79 @@
   (:require [emissary.dispatcher :as dispatcher :refer [Dispatcher]]
             [emissary.event :as event]
             [emissary.util :as util]
-            [clojure.core.async :refer [<! >! chan go go-loop pipe pub sub]]))
+            [clojure.core.async :as core.async
+                                :refer [<! >! chan close! go go-loop pipe pub
+                                        sub]]))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; event handler queues                                                     ;;
+;; event handling                                                           ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defn- event->context [event]
-  {::dispatcher/event event})
+(defn- event-handler [{:keys [context handler] :as config} cofx-fn]
+  (fn [evt]
+    (-> context
+        cofx-fn
+        (assoc ::event evt)
+        handler)))
 
-(defn- merge-coeffect-context-fn [cofx-fn cofx-ctx]
-  (fn [ctx]
-    (cond-> ctx
-      cofx-ctx (merge (cofx-fn cofx-ctx)))))
+(defn- handler->queue [handler]
+  (chan 1 (map handler)))
 
-(defn- event-handler-transducer [handler merge-cofx]
-  (map (comp handler merge-cofx event->context)))
+(defn- ->event-handler-queues [events cofx-fn]
+  (util/initialize-map events (fn [_ handler-config]
+                                (-> handler-config
+                                    (event-handler cofx-fn)
+                                    handler->queue))))
 
-(defn- event-handler->queue [{:keys [context handler]} coeffects]
-  (let [merge-cofx (merge-coeffect-context-fn coeffects context)
-        event-handler-xf (event-handler-transducer handler merge-cofx)]
-    (chan 1 event-handler-xf)))
-
-(defn- map->event-handler-queues [handler-map coeffect-fn]
-  (util/initialize-map handler-map
-                       (fn [_ handler-config]
-                         (event-handler->queue handler-config coeffect-fn))))
+(defn- route-events! [event-queue handler-queues]
+  (let [broker (pub event-queue event/get-id)]
+    (doseq [[event-id handler-queue] handler-queues]
+      (sub broker event-id handler-queue))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; side effect queue                                                        ;;
+;; side effects                                                             ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defn- side-effect-queue [side-effect-fn]
-  (let [queue (chan)]
+(defn- ->side-effect-queue [sfx-fn]
+  (let [q (chan)]
     (go-loop []
-      (let [pending (<! queue)]
-        (side-effect-fn pending)
+      (when-let [sfx (<! q)]
+        (sfx-fn sfx)
         (recur)))
-    queue))
+    q))
+
+(defn- route-side-effects! [handler-queues side-effect-queue]
+  (-> handler-queues
+      vals
+      core.async/merge
+      (pipe side-effect-queue)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; dispatcher                                                               ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(deftype AsyncDispatcher [event-queue broker handler-queues effect-queue]
+(defprotocol Lifecycle
+  (init [dispatcher]
+    "Initialize any dispatcher state required to dispatch events.")
+  (halt [dispatcher]
+    "Tear down any state associated with `dispatcher`."))
+
+(deftype AsyncDispatcher [event-queue handler-queues side-effect-queue]
+  Lifecycle
+  (init [dispatcher]
+    (route-events! event-queue handler-queues)
+    (route-side-effects! handler-queues side-effect-queue)
+    dispatcher)
+
+  (halt [dispatcher]
+    (close! event-queue))
+
   Dispatcher
   (dispatch [_ event]
     (go (>! event-queue event))))
 
-(defn- wire-async-queues! [broker handler-queues effect-queue]
-  (doseq [[event-id handler-queue] handler-queues]
-    (sub broker event-id handler-queue)
-    (pipe handler-queue effect-queue)))
-
-(defn build [handler-map effects-fn]
+(defn build [{:keys [events coeffects side-effects]}]
   (let [event-queue (chan)
-        broker (pub event-queue event/get-id)
-        handler-queues (map->event-handler-queues handler-map effects-fn)
-        effect-queue (side-effect-queue effects-fn)]
-    (wire-async-queues! broker handler-queues effect-queue)
-    (->AsyncDispatcher event-queue broker handler-queues effect-queue)))
+        handler-queues (->event-handler-queues events coeffects)
+        side-effect-queue (->side-effect-queue side-effects)]
+    (->AsyncDispatcher event-queue handler-queues side-effect-queue)))
