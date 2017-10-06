@@ -10,44 +10,32 @@
 ;; event handling                                                           ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defn- event-handler [{:keys [context handler] :as config} cofx-fn]
+(defn- event-handler [{:keys [context handler] :as config} cofx-fn sfx-fn]
   (fn [evt]
     (-> context
         cofx-fn
         (assoc ::event evt)
-        handler)))
+        handler
+        sfx-fn)))
 
 (defn- handler->queue [handler]
-  (chan 1 (map handler)))
+  (let [q (chan)]
+    (go-loop []
+      (when-let [evt (<! q)]
+        (handler evt)
+        (recur)))
+    q))
 
-(defn- ->event-handler-queues [events cofx-fn]
+(defn- ->event-handler-queues [events cofx-fn sfx-fn]
   (util/initialize-map events (fn [_ handler-config]
                                 (-> handler-config
-                                    (event-handler cofx-fn)
+                                    (event-handler cofx-fn sfx-fn)
                                     handler->queue))))
 
 (defn- route-events! [event-queue handler-queues]
   (let [broker (pub event-queue event/get-id)]
     (doseq [[event-id handler-queue] handler-queues]
       (sub broker event-id handler-queue))))
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; side effects                                                             ;;
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-(defn- ->side-effect-queue [sfx-fn]
-  (let [q (chan)]
-    (go-loop []
-      (when-let [sfx (<! q)]
-        (sfx-fn sfx)
-        (recur)))
-    q))
-
-(defn- route-side-effects! [handler-queues side-effect-queue]
-  (-> handler-queues
-      vals
-      core.async/merge
-      (pipe side-effect-queue)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; dispatcher                                                               ;;
@@ -59,11 +47,10 @@
   (halt [dispatcher]
     "Tear down any state associated with `dispatcher`."))
 
-(deftype AsyncDispatcher [event-queue handler-queues side-effect-queue]
+(deftype AsyncDispatcher [event-queue handler-queues]
   Lifecycle
   (init [dispatcher]
     (route-events! event-queue handler-queues)
-    (route-side-effects! handler-queues side-effect-queue)
     dispatcher)
 
   (halt [dispatcher]
@@ -71,10 +58,10 @@
 
   Dispatcher
   (dispatch [_ event]
-    (go (>! event-queue event))))
+    (go (>! event-queue event))
+    nil))
 
 (defn build [{:keys [events coeffects side-effects]}]
   (let [event-queue (chan)
-        handler-queues (->event-handler-queues events coeffects)
-        side-effect-queue (->side-effect-queue side-effects)]
-    (->AsyncDispatcher event-queue handler-queues side-effect-queue)))
+        handler-queues (->event-handler-queues events coeffects side-effects)]
+    (->AsyncDispatcher event-queue handler-queues)))
